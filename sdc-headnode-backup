@@ -154,10 +154,15 @@ __snap_and_send () {
 # backup all zones
 __backup_all () {
     _zones="$(vmadm list -Ho uuid)"
+    _manatee="$(vmadm list -Ho uuid,alias|awk '/manatee/ {print $1}')"
 
-    echo "INFO: backing up all zones.."
+    # Avoid manatee as it rolls its own ZFS snapshots. Snapshotting
+    # from outside can interfere with manatee's own snapshot replication/cleanup.
+    # This also assumes that manatee runs in HA for production and can be
+    # rebuilt from other shards if required.
+    echo "INFO: backing up all zones, except manatee.."
     for _zone in $_zones ; do
-        if [ ! -z $_zone ] ; then
+        if [ ! -z $_zone ] && [ $_zone != $_manatee ] ; then
             __snap_and_send $_zone
         fi
     done
@@ -209,6 +214,10 @@ if [ $use_s3 -eq 1 ] ; then
     export upload_cmd="s3cmd put $s3cmd_flags - s3://$s3bucket"
 elif [ $use_manta -eq 1 ] ; then
     export upload_cmd="mput $mput_flags $mput_destination"
+elif [ $use_file -eq 1 ] ; then
+    export upload_cmd="cat > ${backup_path}"
+    ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+        "mkdir -p ${backup_path}/globalzone/usbkey"
 else
     echo "Error: both Manta and s3 is disabled"
 fi
