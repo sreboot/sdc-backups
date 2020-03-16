@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bin/bash
 #-------------------------------------------------------------------------+
 # Copyright (c) 2015, pannon
 # All rights reserved.
@@ -25,11 +25,17 @@
 # POSSIBILITY OF SUCH DAMAGE.
 #------------------------------------------------------------------------+
 
+set -o pipefail
+
 PATH='/bin:/usr/sbin:/usr/bin:/sbin:/opt/local/bin/'
 
 # If we are on SmartOS source the config file
 if [ $(uname) == 'SunOS' ] ; then
     . /opt/custom/etc/sdc-headnode-backup.conf
+fi
+
+if [ -f /.dcinfo ]; then
+    . /.dcinfo
 fi
 
 snapshot="backup"
@@ -94,12 +100,23 @@ Assumptions:
 EOT
 }
 
+__die () {
+    echo "  ERROR: $@" >&2
+
+    if [! -z "$pd_routing_key" ] ; then
+        _payload="$(__pager_duty_payload $@)"
+        curl -v https://events.pagerduty.com/v2/enqueue -d "$_payload"
+    fi
+
+    exit 1
+}
+
 __backup_json () {
     # save UUID.json configs - just in case we need these..
     echo "INFO: backing up zone_uuid.json configuration files.."
     for zone in $(vmadm list -Ho uuid) ; do
         vmadm get $zone | ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-        "${upload_cmd}/$zone.json"
+        "${upload_cmd}/$zone.json" || __die "${FUNCNAME[0]} failed"
     done
 }
 
@@ -114,20 +131,20 @@ __backup_global_zone () {
     # backup zone *.xml files
     gtar -czf - /etc/zones | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "${upload_cmd}/globalzone/etc-zones.tgz"
+    "${upload_cmd}/globalzone/etc-zones.tgz" || __die "${FUNCNAME[0]} failed"
 
     # backup /var excluding tmp and crash
     gtar --exclude='var/tmp' \
          --exclude='var/crash' \
          --exclude='var/log' -czf - /var | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "${upload_cmd}/globalzone/var.tgz"
+    "${upload_cmd}/globalzone/var.tgz" || __die "${FUNCNAME[0]} failed"
 
     # backup /opt
     zfs snapshot zones/opt@${snapshot}
     zfs send -v zones/opt@${snapshot} | gzip -1 | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "${upload_cmd}/globalzone/opt.zfs.gz"
+    "${upload_cmd}/globalzone/opt.zfs.gz" || __die "${FUNCNAME[0]} failed"
     zfs destroy zones/opt@${snapshot}
 }
 
@@ -145,7 +162,7 @@ __snap_and_send () {
 
     zfs send -vR zones/${_zone}@${snapshot} | gzip -1 | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "${upload_cmd}/${_zone}.zfs.gz"
+    "${upload_cmd}/${_zone}.zfs.gz" || __die "${FUNCNAME[0]} failed"
 
     zfs destroy -r zones/${_zone}@${snapshot}
     __fetch_origin ${_zone}
@@ -206,7 +223,30 @@ __backup_usb_config () {
     echo "Backing up SDC USB config.."
     cat ${sdc_usb_config} | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "${upload_cmd}/globalzone/usbkey/config"
+    "${upload_cmd}/globalzone/usbkey/config" || __die "${FUNCNAME[0]} failed"
+}
+
+__pager_duty_payload () {
+    _date=$(date '+%FT%T.000%z')
+    _error="$@"
+    cat << EOT
+{
+  "payload": {
+    "summary": "sdc-backups: failed to backup headnode in DC: ${SDC_DATACENTER_NAME}",
+    "timestamp": "$_date",
+    "source": "Triton headnode, DC: ${SDC_DATACENTER_NAME}",
+    "severity": "info",
+    "component": "triton",
+    "class": "backup",
+    "custom_details": {
+      "error": "$_error" 
+    }
+  },
+  "routing_key": "${pd_routing_key}",
+  "event_action": "trigger",
+  "client": "cron"
+}
+EOT
 }
 
 # Check whether to use s3cmd or Manta
